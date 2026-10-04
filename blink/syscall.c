@@ -302,6 +302,17 @@ bool DeliverSignalRecursively(struct Machine *m, int sig) {
 bool CheckInterrupt(struct Machine *m, bool restartable) {
   bool res, restart;
   int sig, delivered;
+#ifdef __EMSCRIPTEN__
+  // A thread that exit_group() is killing must leave its system call so
+  // the interpreter loop can exit it: on Emscripten no host signal breaks
+  // blocking calls, and retrying them would never end.
+  if (atomic_load_explicit(&m->killed, memory_order_acquire)) {
+    Put64(m->ax, -EINTR_LINUX);
+    errno = EINTR;
+    m->interrupted = true;
+    return true;
+  }
+#endif
   // an actual i/o call just received EINTR from the kernel
 HandleSomeMoreInterrupts:
   // determine if there's any signals pending for our guest
@@ -4095,6 +4106,31 @@ static int SysSetitimer(struct Machine *m, int which, i64 neuaddr,
   return rc;
 }
 
+#ifdef __EMSCRIPTEN__
+// Emscripten's sleeps aren't interrupted by signals (pthread_kill() can't
+// break a thread out of a host call), so sleep in short naps and fail
+// with EINTR as soon as a guest signal is pending or the thread is being
+// killed by exit_group(). Returns 0 once `deadline` (CLOCK_REALTIME) has
+// passed.
+static int NapUntil(struct Machine *m, struct timespec deadline) {
+  struct timespec now, ts;
+  for (;;) {
+    now = GetTime();
+    if (CompareTime(now, deadline) >= 0) return 0;
+    if (atomic_load_explicit(&m->killed, memory_order_acquire) ||
+        (m->signals & ~m->sigmask)) {
+      errno = EINTR;
+      return -1;
+    }
+    ts = SubtractTime(deadline, now);
+    if (CompareTime(ts, FromMilliseconds(kPollingMs)) > 0) {
+      ts = FromMilliseconds(kPollingMs);
+    }
+    nanosleep(&ts, 0);
+  }
+}
+#endif
+
 static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
   struct timespec_linux gt;
   const struct timespec_linux *gtp;
@@ -4112,7 +4148,11 @@ static int SysNanosleep(struct Machine *m, i64 req, i64 rem) {
   for (;;) {
     if (CompareTime(now, deadline) >= 0) return 0;
     ts = SubtractTime(deadline, now);
+#ifdef __EMSCRIPTEN__
+    if (NapUntil(m, deadline)) {
+#else
     if (nanosleep(&ts, 0)) {
+#endif
       unassert(errno == EINTR);
       // this may run a guest signal handler before returning
       if (CheckInterrupt(m, false)) {
@@ -4152,7 +4192,26 @@ static int SysClockNanosleep(struct Machine *m, int clock, int flags,
   req.tv_sec = Read64(gtimespec.sec);
   req.tv_nsec = Read64(gtimespec.nsec);
 TryAgain:
-#if defined(TIMER_ABSTIME) && !defined(__OpenBSD__)
+#ifdef __EMSCRIPTEN__
+  {
+    struct timespec now, deadline;
+    if (flags & TIMER_ABSTIME_LINUX) {
+      unassert(!clock_gettime(sysclock, &now));
+      if (CompareTime(req, now) > 0) {
+        deadline = AddTime(GetTime(), SubtractTime(req, now));
+      } else {
+        deadline = GetTime();
+      }
+    } else {
+      deadline = AddTime(GetTime(), req);
+    }
+    if ((rc = NapUntil(m, deadline)) == -1) {
+      now = GetTime();
+      rem = CompareTime(now, deadline) < 0 ? SubtractTime(deadline, now)
+                                           : GetZeroTime();
+    }
+  }
+#elif defined(TIMER_ABSTIME) && !defined(__OpenBSD__)
   flags = flags & TIMER_ABSTIME_LINUX ? TIMER_ABSTIME : 0;
   if ((rc = clock_nanosleep(sysclock, flags, &req, &rem))) {
     errno = rc;

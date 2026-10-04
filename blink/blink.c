@@ -364,6 +364,10 @@ void exit(int status) {
   // main thread, so _exit() never reaches Module.onExit. Report the status
   // to the embedder from the main JS thread before exiting.
   MAIN_THREAD_EM_ASM({ if (Module['onExit']) Module['onExit']($0); }, status);
+  // Shut the runtime down for real, which also terminates the pthread
+  // Web Workers; _exit() would leave them running, and an embedder that
+  // starts another instance would accumulate workers until none start.
+  emscripten_force_exit(status);
 #endif
   // main is called multiple times - don't perform cleanup
   _exit(status);

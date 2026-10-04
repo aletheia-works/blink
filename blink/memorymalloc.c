@@ -318,6 +318,16 @@ bool IsOrphan(struct Machine *m) {
   return res;
 }
 
+#ifdef __EMSCRIPTEN__
+// Signals can't interrupt Emscripten threads, and a thread that was just
+// cloned may not run until the browser has started its Web Worker, which
+// can take seconds. Forgetting such a thread early (the "kill9" path)
+// lets it run later against freed memory, so wait much longer here.
+#define kKillTries 600
+#else
+#define kKillTries 10
+#endif
+
 void KillOtherThreads(struct System *s) {
 #ifdef HAVE_THREADS
   int r, t;
@@ -339,10 +349,10 @@ StartOver:
                  m->tid);
         atomic_store_explicit(&m->killed, true, memory_order_release);
         atomic_store_explicit(&m->attention, true, memory_order_release);
-        if (t < 10) {
+        if (t < kKillTries) {
           pthread_kill(m->thread, SIGSYS);
         } else {
-          LOGF("kill9'd thread after 10 tries");
+          LOGF("kill9'd thread after %d tries", kKillTries);
           pthread_kill(m->thread, SIGKILL);
           dll_remove(&s->machines, e);
           UNLOCK(&s->machines_lock);
@@ -976,7 +986,7 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
   // Emscripten maps a file by copying it on the main JS thread, and the
   // loop below maps one 4096-byte page per call, so each page costs a
   // proxied round trip: most of a minute for a 30 MB program. Read the
-  // private file range once instead, and fill anonymous pages from it.
+  // private file range once instead, and fill pool pages from it.
   u8 *prefetch = 0;
   i64 prefetch_offset = offset;
   if (fd != -1 && !shared && (flags & PAGE_MUG) && !(offset & 4095)) {
@@ -1002,6 +1012,25 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
       }
       for (;;) {
         u64 real;
+#ifdef __EMSCRIPTEN__
+        if (prefetch) {
+          // a private copy of the file page, from blink's own page pool:
+          // an Emscripten mmap() costs a 64 KiB-aligned allocation per page
+          u64 page;
+          if ((page = AllocateAnonymousPage(s)) == -1) {
+            ERRF("mmap() crisis: ran out of memory copying a file mapping");
+            PanicDueToMmap();
+          }
+          memcpy(FindHostPage(page), prefetch + (offset - prefetch_offset),
+                 MIN(4096, end - virt));
+          offset += 4096;
+          entry = (page & PAGE_TA) |
+                  (flags & ~(PAGE_MAP | PAGE_MUG | PAGE_RSRV)) | PAGE_HOST |
+                  PAGE_V;
+          s->memstat.reserved -= 1;
+          s->memstat.committed += 1;
+        } else
+#endif
         if (flags & PAGE_MAP) {
           if (flags & PAGE_MUG) {
             u8 *mug;
@@ -1020,19 +1049,7 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
             }
             mugflags = (shared ? MAP_SHARED : MAP_PRIVATE) |
                        (fd == -1 ? MAP_ANONYMOUS_ : 0);
-#ifdef __EMSCRIPTEN__
-            if (prefetch) {
-              mug = AllocateBig(mugsize, sysprot | PROT_READ | PROT_WRITE,
-                                MAP_PRIVATE | MAP_ANONYMOUS_, -1, 0);
-              if (mug) {
-                memcpy(mug, prefetch + (offset - prefetch_offset), mugsize);
-              }
-            } else {
-              mug = AllocateBig(mugsize, sysprot, mugflags, fd, mugoff);
-            }
-#else
             mug = AllocateBig(mugsize, sysprot, mugflags, fd, mugoff);
-#endif
             if (!mug) {
               ERRF("mmap(virt=%" PRIx64
                    ", size=%ld, flags=%#x, fd=%d, offset=%#" PRIx64
