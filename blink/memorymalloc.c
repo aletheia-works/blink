@@ -16,6 +16,7 @@
 │ TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR             │
 │ PERFORMANCE OF THIS SOFTWARE.                                                │
 ╚─────────────────────────────────────────────────────────────────────────────*/
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -41,6 +42,7 @@
 #include "blink/timespec.h"
 #include "blink/types.h"
 #include "blink/util.h"
+#include "blink/vfs.h"
 #include "blink/x86.h"
 
 struct Allocator {
@@ -114,6 +116,30 @@ void FreeBig(void *p, size_t n) {
   if (!p) return;
   unassert(!Munmap(p, n));
 }
+
+#ifdef __EMSCRIPTEN__
+// Reads [offset, offset+size) of a file into a new buffer, zero-filling
+// past the end of the file. Returns null on failure, in which case the
+// caller maps the file page by page as usual.
+static u8 *PrefetchFileRange(int fd, i64 offset, i64 size) {
+  u8 *buf;
+  ssize_t got;
+  i64 done = 0;
+  if (size <= 0 || !(buf = (u8 *)calloc(1, size))) return 0;
+  while (done < size) {
+    got = VfsPread(fd, buf + done, size - done, offset + done);
+    if (got == -1) {
+      if (errno == EINTR) continue;
+      LOGF("prefetching file mapping failed: %s", DescribeHostErrno(errno));
+      free(buf);
+      return 0;
+    }
+    if (!got) break;  // past the end: the rest stays zero
+    done += got;
+  }
+  return buf;
+}
+#endif
 
 void *AllocateBig(size_t n, int prot, int flags, int fd, off_t off) {
   void *p = Mmap(0, n, prot, flags, fd, off, "big");
@@ -946,6 +972,18 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
     AddFileMapViaMap(s, virt, size, fd, offset);
   }
 
+#ifdef __EMSCRIPTEN__
+  // Emscripten maps a file by copying it on the main JS thread, and the
+  // loop below maps one 4096-byte page per call, so each page costs a
+  // proxied round trip: most of a minute for a 30 MB program. Read the
+  // private file range once instead, and fill anonymous pages from it.
+  u8 *prefetch = 0;
+  i64 prefetch_offset = offset;
+  if (fd != -1 && !shared && (flags & PAGE_MUG) && !(offset & 4095)) {
+    prefetch = PrefetchFileRange(fd, offset, size);
+  }
+#endif
+
   // add pml4t entries ensuring intermediary tables exist
   for (result = virt, end = virt + size;;) {
     for (pt = s->cr3, level = 39; level >= 12; level -= 9) {
@@ -982,7 +1020,19 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
             }
             mugflags = (shared ? MAP_SHARED : MAP_PRIVATE) |
                        (fd == -1 ? MAP_ANONYMOUS_ : 0);
+#ifdef __EMSCRIPTEN__
+            if (prefetch) {
+              mug = AllocateBig(mugsize, sysprot | PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS_, -1, 0);
+              if (mug) {
+                memcpy(mug, prefetch + (offset - prefetch_offset), mugsize);
+              }
+            } else {
+              mug = AllocateBig(mugsize, sysprot, mugflags, fd, mugoff);
+            }
+#else
             mug = AllocateBig(mugsize, sysprot, mugflags, fd, mugoff);
+#endif
             if (!mug) {
               ERRF("mmap(virt=%" PRIx64
                    ", size=%ld, flags=%#x, fd=%d, offset=%#" PRIx64
@@ -1015,6 +1065,9 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
                    &rss_delta);
         }
         if ((virt += 4096) >= end) {
+#ifdef __EMSCRIPTEN__
+          free(prefetch);
+#endif
           s->rss += rss_delta;
           s->vss += vss_delta;
 #ifndef DISABLE_JIT

@@ -70,6 +70,7 @@ void OpBit(P) {
   m->flags = SetFlag(m->flags, FLAGS_CF, !!(y & x));
   switch (op) {
     case 4:
+      if (Lock(rde)) UnlockBus(p);
       return;
     case 5:
       z = Bts(x, y);
@@ -83,6 +84,11 @@ void OpBit(P) {
     default:
       OpUdImpl(m);
   }
-  WriteRegisterOrMemory(rde, p, z);
-  if (Lock(rde)) UnlockBus(p);
+  if (Lock(rde)) {
+    // the bus lock is already held (see WriteMemoryUnlocked)
+    WriteMemoryUnlocked(rde, p, z);
+    UnlockBus(p);
+  } else {
+    WriteRegisterOrMemory(rde, p, z);
+  }
 }

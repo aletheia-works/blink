@@ -282,6 +282,19 @@ void WriteMemory(u64 rde, u8 p[8], u64 x) {
   }
 }
 
+// Writes memory while the caller already holds the bus lock for p. On
+// hosts without 64-bit atomics (CAN_64BIT is 0, e.g. wasm32), Store64()
+// takes the bus lock itself, which would deadlock here.
+void WriteMemoryUnlocked(u64 rde, u8 p[8], u64 x) {
+  if (Rexw(rde)) {
+    Store64Unlocked(p, x);
+  } else if (!Osz(rde)) {
+    Store32(p, x);
+  } else {
+    Store16(p, x);
+  }
+}
+
 void WriteRegisterOrMemory(u64 rde, u8 p[8], u64 x) {
   if (IsModrmRegister(rde)) {
     WriteRegister(rde, p, x);

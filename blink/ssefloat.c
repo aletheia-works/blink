@@ -122,7 +122,9 @@ void OpPextrwGdqpUdqIb(P) {
   u8 i;
   i = uimm0;
   i &= Osz(rde) ? 7 : 3;
-  Put16(RegRexrReg(m, rde), Get16(XmmRexbRm(m, rde) + i * 2));
+  // the word is zero-extended into the whole general register (Intel SDM
+  // PEXTRW); writing only 16 bits would leave stale upper bits behind
+  Put64(RegRexrReg(m, rde), Get16(XmmRexbRm(m, rde) + i * 2));
 }
 
 void OpPinsrwVdqEwIb(P) {

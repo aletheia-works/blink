@@ -73,6 +73,7 @@ i64 ReadRegisterSigned(u64, u8[8]);
 u64 ReadMemory(u64, u8[8]);
 u64 ReadMemorySigned(u64, u8[8]);
 u64 ReadMemoryUnlocked(u64, u8[8]);
+void WriteMemoryUnlocked(u64, u8[8], u64);
 u64 ReadRegister(u64, u8[8]);
 void WriteMemory(u64, u8[8], u64);
 void WriteRegister(u64, u8[8], u64);

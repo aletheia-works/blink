@@ -570,12 +570,17 @@ int EmuEventfd(struct Machine *m, u32 initval, i32 flags) {
 ////////////////////////////////////////////////////////////////////////////////
 // streams (pipes and AF_UNIX stream socket pairs)
 
+// Copies up to b->len bytes into iov, starting `skip` bytes into it.
 static size_t EmuBufRead(struct EmuBuf *b, const struct iovec *iov,
-                         int iovcnt, bool peek) {
+                         int iovcnt, size_t skip, bool peek) {
   int i;
   size_t k, n, got, pos;
   for (got = 0, pos = b->head, i = 0; i < iovcnt && got < b->len; ++i) {
-    for (n = 0; n < iov[i].iov_len && got < b->len;) {
+    if (skip >= iov[i].iov_len) {
+      skip -= iov[i].iov_len;
+      continue;
+    }
+    for (n = skip, skip = 0; n < iov[i].iov_len && got < b->len;) {
       k = MIN(iov[i].iov_len - n, b->len - got);
       k = MIN(k, b->cap - pos);
       memcpy((u8 *)iov[i].iov_base + n, b->data + pos, k);
@@ -630,24 +635,7 @@ static ssize_t EmuStreamRecv(int fildes, struct EmuObj *o,
   waitall = (flags & MSG_WAITALL) && !peek && !nonblock;
   for (got = 0;;) {
     if (o->in->len) {
-      if (got) {
-        struct iovec rest[IOV_MAX_LINUX];
-        int i, j;
-        size_t skip = got;
-        for (j = i = 0; i < iovcnt && j < IOV_MAX_LINUX; ++i) {
-          if (skip >= iov[i].iov_len) {
-            skip -= iov[i].iov_len;
-            continue;
-          }
-          rest[j].iov_base = (u8 *)iov[i].iov_base + skip;
-          rest[j].iov_len = iov[i].iov_len - skip;
-          skip = 0;
-          ++j;
-        }
-        got += EmuBufRead(o->in, rest, j, peek);
-      } else {
-        got += EmuBufRead(o->in, iov, iovcnt, peek);
-      }
+      got += EmuBufRead(o->in, iov, iovcnt, got, peek);
       if (!peek) EmuNotify();
       if (!waitall || got == want) return got;
       continue;

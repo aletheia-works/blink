@@ -162,6 +162,14 @@ void TerminateSignal(struct Machine *m, int sig, int code) {
          DescribeSignal(sig), m->ip, code, m->faultaddr);
     PrintDiagnostics(m);
   }
+#ifdef __EMSCRIPTEN__
+  // There's no host process to kill: report the conventional 128+signal
+  // exit status to the embedder instead of aborting the runtime.
+  (void)syssig;
+  (void)sa;
+  FreeMachine(m);
+  exit(128 + sig);
+#endif
   if ((syssig = XlatSignal(sig)) == -1) syssig = SIGKILL;
   FreeMachine(m);
 #ifdef HAVE_JIT

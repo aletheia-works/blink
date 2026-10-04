@@ -1613,11 +1613,29 @@ static int SysUname(struct Machine *m, i64 utsaddr) {
   return CopyToUser(m, utsaddr, &uts, sizeof(uts));
 }
 
+#ifdef __EMSCRIPTEN__
+static long eafnosupport(void) {
+  errno = EAFNOSUPPORT;
+  return -1;
+}
+#endif
+
 static int SysSocket(struct Machine *m, i32 family, i32 type, i32 protocol) {
   struct Fd *fd;
   int lim, flags, fildes;
   flags = type & (SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
   type &= ~(SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
+#ifdef __EMSCRIPTEN__
+  // The browser build has no network. Emscripten would otherwise tunnel
+  // guest sockets over WebSockets (and on Node.js require the `ws`
+  // package), so refuse them like a kernel without that address family.
+  // Connected AF_UNIX pairs still work through socketpair() (emufd.c).
+  (void)fd;
+  (void)lim;
+  (void)fildes;
+  (void)protocol;
+  return eafnosupport();
+#endif
   if ((type = XlatSocketType(type)) == -1) return -1;
   if ((family = XlatSocketFamily(family)) == -1) return -1;
   if ((protocol = XlatSocketProtocol(protocol)) == -1) return -1;
