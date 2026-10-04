@@ -351,6 +351,12 @@ static void HandleSigs(void) {
 
 #if defined(__EMSCRIPTEN__)
 void exit(int status) {
+#ifdef __EMSCRIPTEN_PTHREADS__
+  // With -sPROXY_TO_PTHREAD the runtime keeps itself alive for the proxied
+  // main thread, so _exit() never reaches Module.onExit. Report the status
+  // to the embedder from the main JS thread before exiting.
+  MAIN_THREAD_EM_ASM({ if (Module['onExit']) Module['onExit']($0); }, status);
+#endif
   // main is called multiple times - don't perform cleanup
   _exit(status);
 }

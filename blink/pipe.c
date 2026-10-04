@@ -25,6 +25,7 @@
 
 #include "blink/assert.h"
 #include "blink/atomic.h"
+#include "blink/emufd.h"
 #include "blink/endian.h"
 #include "blink/errno.h"
 #include "blink/fds.h"
@@ -51,6 +52,15 @@ int SysPipe2(struct Machine *m, i64 pipefds_addr, i32 flags) {
     return efault();
   }
   if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
+#ifdef HAVE_EMUFD
+  // Pipes are emulated so they block, and so epoll can watch them. Host
+  // pipes on Emscripten never block: an empty read fails with EAGAIN.
+  if (EmuPipe(m, fds, flags) == -1) return -1;
+  Write32(fds_linux[0], fds[0]);
+  Write32(fds_linux[1], fds[1]);
+  unassert(!CopyToUserWrite(m, pipefds_addr, fds_linux, sizeof(fds_linux)));
+  return 0;
+#endif
 #ifdef HAVE_PIPE2
   if ((rc = VfsPipe2(fds, (oflags = XlatOpenFlags(flags)))) != -1) {
 #else

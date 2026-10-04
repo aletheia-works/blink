@@ -15,12 +15,28 @@
 
 #define FUTEX_CONTAINER(e) DLL_CONTAINER(struct Futex, elem, e)
 
+// Each waiter takes a slot recording its FUTEX_WAIT_BITSET mask, so a
+// wake only marks the waiters whose mask intersects the waker's. Slots
+// live inside the futex (not on waiters' stacks) because g_bus may be
+// shared with forked processes. Waiters that find no free slot fall back
+// to being woken by any wake at all, which futex semantics permit.
+#define kFutexSlots 32
+
+struct FutexSlot {
+  u32 bitset;
+  bool used;
+  bool woken;
+};
+
 struct Futex {
   i64 addr;
   int waiters;
+  int slotless;  // waiters without a slot
+  u32 wakeseq;   // bumped when slotless waiters are woken
   struct Dll elem;
   pthread_cond_t_ cond;
   pthread_mutex_t_ lock;
+  struct FutexSlot slots[kFutexSlots];
 };
 
 struct Futexes {

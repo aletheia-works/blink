@@ -47,8 +47,10 @@ ssize_t readansi(int fd, char *buf, size_t size) {
         continue;
       }
       if (rc == -1 && errno == EAGAIN) {
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
         emscripten_sleep(50);
+#elif defined(__EMSCRIPTEN__)
+        usleep(50000);  // workers may block; no Asyncify in this build
 #else
         struct pollfd pfd;
         pfd.fd = fd;

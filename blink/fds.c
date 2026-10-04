@@ -30,6 +30,7 @@
 #include "blink/assert.h"
 #include "blink/atomic.h"
 #include "blink/builtin.h"
+#include "blink/emufd.h"
 #include "blink/errno.h"
 #include "blink/log.h"
 #include "blink/macros.h"
@@ -63,6 +64,12 @@ struct Fd *ForkFd(struct Fds *fds, struct Fd *fd, int fildes, int oflags) {
   struct Fd *fd2;
   if ((fd2 = AddFd(fds, fildes, oflags))) {
     if (fd) {
+      // keep the callbacks: a duplicate of an emulated descriptor (see
+      // emufd.h) must reach the same emulated object
+      fd2->cb = fd->cb;
+#ifdef HAVE_EMUFD
+      if (fd->cb == &kFdCbEmu) EmuDupFd(fd->fildes, fildes);
+#endif
       fd2->path = fd->path ? strdup(fd->path) : 0;
       fd2->socktype = fd->socktype;
       fd2->norestart = fd->norestart;

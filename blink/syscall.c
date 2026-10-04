@@ -57,6 +57,7 @@
 #include "blink/case.h"
 #include "blink/checked.h"
 #include "blink/debug.h"
+#include "blink/emufd.h"
 #include "blink/endian.h"
 #include "blink/errno.h"
 #include "blink/flag.h"
@@ -100,12 +101,40 @@
 #include <sched.h>
 #endif
 
-#ifdef HAVE_EPOLL_PWAIT1
+#if defined(HAVE_EPOLL_PWAIT1) && !defined(HAVE_EMUFD)
 #include <sys/epoll.h>
 #endif
 
 #ifdef HAVE_SYS_MOUNT_H
 #include <sys/mount.h>
+#endif
+
+// Socket calls on emulated descriptors (see emufd.h) never reach the host.
+#ifdef HAVE_EMUFD
+#define SENDMSG_(fd, msg, fl) \
+  (EmuIsFd(fd) ? EmuSendmsg(fd, msg, fl) : VfsSendmsg(fd, msg, fl))
+#define RECVMSG_(fd, msg, fl) \
+  (EmuIsFd(fd) ? EmuRecvmsg(fd, msg, fl) : VfsRecvmsg(fd, msg, fl))
+#define SHUTDOWN_(fd, how) \
+  (EmuIsFd(fd) ? EmuShutdown(fd, how) : VfsShutdown(fd, how))
+#define GETSOCKOPT_(fd, lvl, opt, val, len)          \
+  (EmuIsFd(fd) ? EmuGetsockopt(fd, lvl, opt, val, len) \
+               : VfsGetsockopt(fd, lvl, opt, val, len))
+#define SETSOCKOPT_(fd, lvl, opt, val, len)          \
+  (EmuIsFd(fd) ? EmuSetsockopt(fd, lvl, opt, val, len) \
+               : VfsSetsockopt(fd, lvl, opt, val, len))
+#define GETSOCKNAME_(fd, sa, len) \
+  (EmuIsFd(fd) ? EmuGetsockname(fd, sa, len) : VfsGetsockname(fd, sa, len))
+#define GETPEERNAME_(fd, sa, len) \
+  (EmuIsFd(fd) ? EmuGetsockname(fd, sa, len) : VfsGetpeername(fd, sa, len))
+#else
+#define SENDMSG_     VfsSendmsg
+#define RECVMSG_     VfsRecvmsg
+#define SHUTDOWN_    VfsShutdown
+#define GETSOCKOPT_  VfsGetsockopt
+#define SETSOCKOPT_  VfsSetsockopt
+#define GETSOCKNAME_ VfsGetsockname
+#define GETPEERNAME_ VfsGetpeername
 #endif
 
 #ifdef SO_LINGER_SEC
@@ -152,9 +181,17 @@ static int SystemIoctl(int fd, unsigned long request, ...) {
 // back to the main loop. Yield regularly when the process waits for some
 // user input.
 
+#ifdef __EMSCRIPTEN_PTHREADS__
+// With pthreads, guest threads run on Web Workers, which may block, so
+// there's no need to yield to the browser through Asyncify.
+#define em_sleep_ms(ms) usleep((ms) * 1000)
+#else
+#define em_sleep_ms(ms) emscripten_sleep(ms)
+#endif
+
 int em_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
   int ret = VfsPoll(fds, nfds, timeout);
-  if (ret == 0) emscripten_sleep(50);
+  if (ret == 0 && timeout) em_sleep_ms(50);
   return ret;
 }
 
@@ -168,7 +205,7 @@ ssize_t em_readv(int fd, const struct iovec *iov, int iovcnt) {
     }
   }
   size_t ret = VfsReadv(fd, iov, iovcnt);
-  if (ret == -1 && errno == EAGAIN) emscripten_sleep(50);
+  if (ret == -1 && errno == EAGAIN) em_sleep_ms(50);
   return ret;
 }
 #endif
@@ -305,8 +342,10 @@ static struct Futex *FindFutex(struct Machine *m, i64 addr) {
   return 0;
 }
 
-static int SysFutexWake(struct Machine *m, i64 uaddr, u32 count) {
-  int rc;
+// Wakes up to `count` waiters at `uaddr` whose FUTEX_WAIT_BITSET mask
+// intersects `bitset`, returning how many were woken.
+static int FutexWake(struct Machine *m, i64 uaddr, u32 count, u32 bitset) {
+  int i, rc;
   struct Futex *f;
   if (!count) return 0;
   LOCK(&g_bus->futexes.lock);
@@ -314,24 +353,34 @@ static int SysFutexWake(struct Machine *m, i64 uaddr, u32 count) {
     LOCK(&f->lock);
   }
   UNLOCK(&g_bus->futexes.lock);
+  rc = 0;
   if (f && f->waiters) {
-    THR_LOGF("pid=%d tid=%d is waking %d waiters at address %#" PRIx64,
-             m->system->pid, m->tid, f->waiters, uaddr);
-    if (count == 1) {
-      unassert(!pthread_cond_signal(&f->cond));
-      rc = 1;
-    } else {
-      unassert(!pthread_cond_broadcast(&f->cond));
-      rc = f->waiters;
+    for (i = 0; i < kFutexSlots && (u32)rc < count; ++i) {
+      if (f->slots[i].used && !f->slots[i].woken &&
+          (f->slots[i].bitset & bitset)) {
+        f->slots[i].woken = true;
+        ++rc;
+      }
     }
+    if (f->slotless && (u32)rc < count) {
+      // slotless waiters can't be told apart, so all of them wake up
+      ++f->wakeseq;
+      rc += MIN((u32)f->slotless, count - rc);
+    }
+    THR_LOGF("pid=%d tid=%d is waking %d of %d waiters at address %#" PRIx64,
+             m->system->pid, m->tid, rc, f->waiters, uaddr);
+    if (rc) unassert(!pthread_cond_broadcast(&f->cond));
     UNLOCK(&f->lock);
   } else {
     if (f) UNLOCK(&f->lock);
     THR_LOGF("pid=%d tid=%d is waking no one at address %#" PRIx64,
              m->system->pid, m->tid, uaddr);
-    rc = 0;
   }
   return rc;
+}
+
+static int SysFutexWake(struct Machine *m, i64 uaddr, u32 count) {
+  return FutexWake(m, uaddr, count, 0xffffffffu);
 }
 
 static void ClearChildTid(struct Machine *m) {
@@ -653,31 +702,39 @@ static int LoadTimespecRW(struct Machine *m, i64 addr, struct timespec *ts) {
   return LoadTimespec(m, addr, ts, PAGE_U | PAGE_RW, PAGE_U | PAGE_RW);
 }
 
-static int SysFutexWait(struct Machine *m,  //
-                        i64 uaddr,          //
-                        i32 op,             //
-                        u32 expect,         //
-                        i64 timeout_addr) {
-  int rc;
-  u8 *mem;
-  struct Futex *f;
-  const struct timespec_linux *gtimeout;
-  struct timespec now, tick, timeout, deadline;
-  now = tick = GetTime();
-  if (timeout_addr) {
-    if (!(gtimeout = (const struct timespec_linux *)SchlepR(
-              m, timeout_addr, sizeof(*gtimeout)))) {
-      return -1;
+static int FutexTakeSlot(struct Futex *f, u32 bitset) {
+  int i;
+  for (i = 0; i < kFutexSlots; ++i) {
+    if (!f->slots[i].used) {
+      f->slots[i].used = true;
+      f->slots[i].woken = false;
+      f->slots[i].bitset = bitset;
+      return i;
     }
-    timeout.tv_sec = Read64(gtimeout->sec);
-    timeout.tv_nsec = Read64(gtimeout->nsec);
-    if (!(0 <= timeout.tv_nsec && timeout.tv_nsec < 1000000000)) {
-      return einval();
-    }
-    deadline = AddTime(now, timeout);
-  } else {
-    deadline = GetMaxTime();
   }
+  ++f->slotless;
+  return -1;
+}
+
+static void FutexDropSlot(struct Futex *f, int slot) {
+  if (slot >= 0) {
+    f->slots[slot].used = false;
+    f->slots[slot].woken = false;
+  } else {
+    --f->slotless;
+  }
+}
+
+// Waits at `uaddr` while it holds `expect`, until woken by a wake whose
+// bitset intersects `bitset`, or until `deadline` (CLOCK_REALTIME).
+static int FutexWait(struct Machine *m, i64 uaddr, u32 expect,
+                     struct timespec deadline, u32 bitset) {
+  int rc, slot;
+  u8 *mem;
+  u32 wakeseq;
+  struct Futex *f;
+  struct timespec tick;
+  tick = GetTime();
   if (!(mem = LookupAddress(m, uaddr))) return -1;
   LOCK(&g_bus->futexes.lock);
   if (Load32(mem) != expect) {
@@ -691,15 +748,22 @@ static int SysFutexWait(struct Machine *m,  //
   }
   if (!f) {
     if ((f = NewFutex(uaddr))) {
+      f->slotless = 0;
+      f->wakeseq = 0;
+      memset(f->slots, 0, sizeof(f->slots));
       dll_make_first(&g_bus->futexes.active, &f->elem);
     } else {
       UNLOCK(&g_bus->futexes.lock);
       return -1;
     }
   }
+  LOCK(&f->lock);
+  slot = FutexTakeSlot(f, bitset);
+  wakeseq = f->wakeseq;
+  UNLOCK(&f->lock);
   UNLOCK(&g_bus->futexes.lock);
-  THR_LOGF("pid=%d tid=%d is waiting at address %#" PRIx64, m->system->pid,
-           m->tid, uaddr);
+  THR_LOGF("pid=%d tid=%d is waiting at address %#" PRIx64 " bitset %#" PRIx32,
+           m->system->pid, m->tid, uaddr, bitset);
   do {
     if (m->killed) {
       rc = EAGAIN;
@@ -714,7 +778,8 @@ static int SysFutexWait(struct Machine *m,  //
       break;
     }
     LOCK(&f->lock);
-    if (Load32(mem) != expect) {
+    if ((slot >= 0 && f->slots[slot].woken) ||
+        (slot < 0 && f->wakeseq != wakeseq) || Load32(mem) != expect) {
       rc = 0;
     } else {
       tick = AddTime(tick, FromMilliseconds(kPollingMs));
@@ -725,11 +790,17 @@ static int SysFutexWait(struct Machine *m,  //
       } else {
         THR_LOGF("futex wait returned %s", DescribeHostErrno(rc));
       }
+      // a broadcast may be for another waiter: recheck the conditions
+      if (rc == 0) rc = ETIMEDOUT;
     }
     UNLOCK(&f->lock);
   } while (rc == ETIMEDOUT && CompareTime(tick, deadline) < 0);
   LOCK(&g_bus->futexes.lock);
   LOCK(&f->lock);
+  if (rc == ETIMEDOUT && slot >= 0 && f->slots[slot].woken) {
+    rc = 0;  // woken right as the deadline passed: report the wake
+  }
+  FutexDropSlot(f, slot);
   if (!--f->waiters) {
     dll_remove(&g_bus->futexes.active, &f->elem);
     UNLOCK(&f->lock);
@@ -746,6 +817,63 @@ static int SysFutexWait(struct Machine *m,  //
   return rc;
 }
 
+// FUTEX_WAIT: the timeout is relative.
+static int SysFutexWait(struct Machine *m, i64 uaddr, u32 expect,
+                        i64 timeout_addr) {
+  struct timespec timeout, deadline;
+  const struct timespec_linux *gtimeout;
+  if (timeout_addr) {
+    if (!(gtimeout = (const struct timespec_linux *)SchlepR(
+              m, timeout_addr, sizeof(*gtimeout)))) {
+      return -1;
+    }
+    timeout.tv_sec = Read64(gtimeout->sec);
+    timeout.tv_nsec = Read64(gtimeout->nsec);
+    if (timeout.tv_sec < 0 ||
+        !(0 <= timeout.tv_nsec && timeout.tv_nsec < 1000000000)) {
+      return einval();
+    }
+    deadline = AddTime(GetTime(), timeout);
+  } else {
+    deadline = GetMaxTime();
+  }
+  return FutexWait(m, uaddr, expect, deadline, 0xffffffffu);
+}
+
+// FUTEX_WAIT_BITSET: the timeout is an absolute time on CLOCK_MONOTONIC,
+// or on CLOCK_REALTIME when FUTEX_CLOCK_REALTIME is set. It's converted
+// to a CLOCK_REALTIME deadline, which is what the wait loop measures.
+static int SysFutexWaitBitset(struct Machine *m, i64 uaddr, u32 expect,
+                              i64 timeout_addr, u32 bitset, bool realtime) {
+  struct timespec when, now, deadline;
+  const struct timespec_linux *gtimeout;
+  if (!bitset) return einval();
+  if (timeout_addr) {
+    if (!(gtimeout = (const struct timespec_linux *)SchlepR(
+              m, timeout_addr, sizeof(*gtimeout)))) {
+      return -1;
+    }
+    when.tv_sec = Read64(gtimeout->sec);
+    when.tv_nsec = Read64(gtimeout->nsec);
+    if (when.tv_sec < 0 || !(0 <= when.tv_nsec && when.tv_nsec < 1000000000)) {
+      return einval();
+    }
+    if (realtime) {
+      deadline = when;
+    } else {
+      now = GetMonotonic();
+      if (CompareTime(when, now) <= 0) {
+        deadline = GetTime();  // already expired
+      } else {
+        deadline = AddTime(GetTime(), SubtractTime(when, now));
+      }
+    }
+  } else {
+    deadline = GetMaxTime();
+  }
+  return FutexWait(m, uaddr, expect, deadline, bitset);
+}
+
 static int SysFutex(struct Machine *m,  //
                     i64 uaddr,          //
                     i32 op,             //
@@ -753,21 +881,23 @@ static int SysFutex(struct Machine *m,  //
                     i64 timeout_addr,   //
                     i64 uaddr2,         //
                     u32 val3) {
+  bool realtime;
   if (uaddr & 3) return efault();
   op &= ~FUTEX_PRIVATE_FLAG_LINUX;
+  realtime = !!(op & FUTEX_CLOCK_REALTIME_LINUX);
+  op &= ~FUTEX_CLOCK_REALTIME_LINUX;
   switch (op) {
     case FUTEX_WAIT_LINUX:
-      return SysFutexWait(m, uaddr, op, val, timeout_addr);
+      if (realtime) return enosys();  // as Linux: only bitset ops take it
+      return SysFutexWait(m, uaddr, val, timeout_addr);
     case FUTEX_WAKE_LINUX:
       return SysFutexWake(m, uaddr, val);
     case FUTEX_WAIT_BITSET_LINUX:
-    case FUTEX_WAIT_BITSET_LINUX | FUTEX_CLOCK_REALTIME_LINUX:
-      // will be supported soon
-      // avoid logging when cosmo feature checks this
-      if (!m->system->iscosmo) goto DefaultCase;
-      return einval();
+      return SysFutexWaitBitset(m, uaddr, val, timeout_addr, val3, realtime);
+    case FUTEX_WAKE_BITSET_LINUX:
+      if (!val3) return einval();
+      return FutexWake(m, uaddr, val, val3);
     default:
-    DefaultCase:
       LOGF("unsupported %s op %#x", "futex", op);
       return einval();
   }
@@ -1518,6 +1648,23 @@ static int SysSocketpair(struct Machine *m, i32 family, i32 type, i32 protocol,
   int rc, lim, flags, sysflags, fds[2];
   flags = type & (SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
   type &= ~(SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
+#ifdef HAVE_EMUFD
+  // AF_UNIX pairs are emulated: hosts like Emscripten have no socketpair()
+  if (family == AF_UNIX_LINUX) {
+    if (protocol && protocol != AF_UNIX_LINUX) {
+      errno = EPROTONOSUPPORT;
+      return -1;
+    }
+    if (!IsValidMemory(m, pipefds_addr, sizeof(fds_linux), PROT_WRITE)) {
+      return -1;
+    }
+    if (EmuSocketpair(m, type, flags, fds) == -1) return -1;
+    Write32(fds_linux[0], fds[0]);
+    Write32(fds_linux[1], fds[1]);
+    unassert(!CopyToUserWrite(m, pipefds_addr, fds_linux, sizeof(fds_linux)));
+    return 0;
+  }
+#endif
   if ((type = XlatSocketType(type)) == -1) return -1;
   if ((family = XlatSocketFamily(family)) == -1) return -1;
   if ((protocol = XlatSocketProtocol(protocol)) == -1) return -1;
@@ -1617,12 +1764,20 @@ static int SysSocketName(struct Machine *m, i32 fildes, i64 sockaddr_addr,
   return rc;
 }
 
+static int Getsockname_(int fd, struct sockaddr *sa, socklen_t *len) {
+  return GETSOCKNAME_(fd, sa, len);
+}
+
+static int Getpeername_(int fd, struct sockaddr *sa, socklen_t *len) {
+  return GETPEERNAME_(fd, sa, len);
+}
+
 static int SysGetsockname(struct Machine *m, int fd, i64 aa, i64 asa) {
-  return SysSocketName(m, fd, aa, asa, VfsGetsockname);
+  return SysSocketName(m, fd, aa, asa, Getsockname_);
 }
 
 static int SysGetpeername(struct Machine *m, int fd, i64 aa, i64 asa) {
-  return SysSocketName(m, fd, aa, asa, VfsGetpeername);
+  return SysSocketName(m, fd, aa, asa, Getpeername_);
 }
 
 static int GetNoRestart(struct Machine *m, int fildes, bool *norestart) {
@@ -1905,7 +2060,7 @@ static i64 SysSendto(struct Machine *m,  //
   if ((rc = AppendIovsReal(m, &iv, bufaddr, buflen, PROT_READ)) != -1) {
     msg.msg_iov = iv.p;
     msg.msg_iovlen = iv.i;
-    INTERRUPTIBLE(!norestart, rc = VfsSendmsg(fildes, &msg, hostflags));
+    INTERRUPTIBLE(!norestart, rc = SENDMSG_(fildes, &msg, hostflags));
   }
   FreeIovs(&iv);
   return HandleSigpipe(m, rc, flags);
@@ -1936,7 +2091,7 @@ static i64 SysRecvfrom(struct Machine *m,  //
   if ((rc = AppendIovsReal(m, &iv, bufaddr, buflen, PROT_WRITE)) != -1) {
     msg.msg_iov = iv.p;
     msg.msg_iovlen = iv.i;
-    INTERRUPTIBLE(!norestart, rc = VfsRecvmsg(fildes, &msg, hostflags));
+    INTERRUPTIBLE(!norestart, rc = RECVMSG_(fildes, &msg, hostflags));
     if (rc != -1) {
       StoreSockaddr(m, sockaddr_addr, sockaddr_size_addr,
                     (struct sockaddr *)msg.msg_name, msg.msg_namelen);
@@ -2001,7 +2156,7 @@ static i64 SysSendmsg(struct Machine *m, i32 fildes, i64 msgaddr, i32 flags) {
   if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_READ)) != -1) {
     msg.msg_iov = iv.p;
     msg.msg_iovlen = iv.i;
-    INTERRUPTIBLE(!norestart, rc = VfsSendmsg(fildes, &msg, flags));
+    INTERRUPTIBLE(!norestart, rc = SENDMSG_(fildes, &msg, flags));
   }
   FreeIovs(&iv);
   return HandleSigpipe(m, rc, flags);
@@ -2044,7 +2199,7 @@ static i64 SysRecvmsg(struct Machine *m, i32 fildes, i64 msgaddr, i32 flags) {
       msg.msg_name = &addr;
       msg.msg_namelen = sizeof(addr);
     }
-    INTERRUPTIBLE(!norestart, rc = VfsRecvmsg(fildes, &msg, flags));
+    INTERRUPTIBLE(!norestart, rc = RECVMSG_(fildes, &msg, flags));
     if (rc != -1) {
       Write32(gm.flags, UnXlatMsgFlags(msg.msg_flags));
       unassert(CopyToUserWrite(m, msgaddr, &gm, sizeof(gm)) != -1);
@@ -2214,7 +2369,7 @@ static int GetsockoptInt32(struct Machine *m, i32 fd, int level, int optname,
   optvalsize_linux = Read32(psize);
   if (!IsValidMemory(m, optvaladdr, optvalsize_linux, PROT_WRITE)) return -1;
   optvalsize = sizeof(val);
-  if ((rc = VfsGetsockopt(fd, level, optname, &val, &optvalsize)) != -1) {
+  if ((rc = GETSOCKOPT_(fd, level, optname, &val, &optvalsize)) != -1) {
     if ((val = xlat(val)) == -1) return -1;
     Write32(gval, val);
     CopyToUserWrite(m, optvaladdr, &gval, MIN(sizeof(gval), optvalsize_linux));
@@ -2234,7 +2389,7 @@ static int SetsockoptLinger(struct Machine *m, i32 fildes, i64 optvaladdr,
   }
   hl.l_onoff = (i32)Read32(gl->onoff);
   hl.l_linger = (i32)Read32(gl->linger);
-  return VfsSetsockopt(fildes, SOL_SOCKET, SO_LINGER_, &hl, sizeof(hl));
+  return SETSOCKOPT_(fildes, SOL_SOCKET, SO_LINGER_, &hl, sizeof(hl));
 }
 
 static int GetsockoptLinger(struct Machine *m, i32 fd, i64 optvaladdr,
@@ -2249,7 +2404,7 @@ static int GetsockoptLinger(struct Machine *m, i32 fd, i64 optvaladdr,
   optvalsize_linux = Read32(psize);
   if (!IsValidMemory(m, optvaladdr, optvalsize_linux, PROT_WRITE)) return -1;
   optvalsize = sizeof(hl);
-  if ((rc = VfsGetsockopt(fd, SOL_SOCKET, SO_LINGER_, &hl, &optvalsize)) !=
+  if ((rc = GETSOCKOPT_(fd, SOL_SOCKET, SO_LINGER_, &hl, &optvalsize)) !=
       -1) {
     Write32(gl.onoff, hl.l_onoff);
     Write32(gl.linger, hl.l_linger);
@@ -2281,7 +2436,7 @@ static int SysSetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
   if (XlatSocketLevel(level, &syslevel) == -1) return -1;
   if ((sysoptname = XlatSocketOptname(level, optname)) == -1) return -1;
   if (!(optval = SchlepR(m, optvaladdr, optvalsize))) return -1;
-  rc = VfsSetsockopt(fildes, syslevel, sysoptname, optval, optvalsize);
+  rc = SETSOCKOPT_(fildes, syslevel, sysoptname, optval, optvalsize);
   if (rc != -1 &&                      //
       level == SOL_SOCKET_LINUX &&     //
       optname == SO_RCVTIMEO_LINUX &&  //
@@ -2329,7 +2484,7 @@ static int SysGetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
   optvalsize = Read32(optvalsize_linux);
   if (optvalsize > 256) return einval();
   if (!(optval = AddToFreeList(m, calloc(1, optvalsize)))) return -1;
-  rc = VfsGetsockopt(fildes, syslevel, sysoptname, optval, &optvalsize);
+  rc = GETSOCKOPT_(fildes, syslevel, sysoptname, optval, &optvalsize);
   Write32(optvalsize_linux, optvalsize);
   CopyToUserWrite(m, optvaladdr, optval, optvalsize);
   CopyToUserWrite(m, optvalsizeaddr, optvalsize_linux,
@@ -3062,12 +3217,29 @@ static int XlatLock(int x) {
 }
 
 static int SysFlock(struct Machine *m, i32 fd, i32 lock) {
+#ifdef __EMSCRIPTEN__
+  int rc;
+  struct timespec wait;
+  if ((lock = XlatLock(lock)) == -1) return -1;
+  if ((lock & LOCK_UN) || (lock & LOCK_NB)) return VfsFlock(fd, lock);
+  // Emscripten's flock() runs on the main JS thread, which mustn't block,
+  // so it never waits. Wait here instead, on the guest's own thread.
+  for (;;) {
+    if ((rc = VfsFlock(fd, lock | LOCK_NB)) != -1 || errno != EWOULDBLOCK) {
+      return rc;
+    }
+    if (CheckInterrupt(m, true)) return -1;  // errno is EINTR
+    wait = FromMilliseconds(kPollingMs);
+    nanosleep(&wait, 0);
+  }
+#else
   if ((lock = XlatLock(lock)) == -1) return -1;
   return VfsFlock(fd, lock);
+#endif
 }
 
 static int SysShutdown(struct Machine *m, i32 fd, i32 how) {
-  return VfsShutdown(fd, XlatShutdown(how));
+  return SHUTDOWN_(fd, XlatShutdown(how));
 }
 
 static int SysListen(struct Machine *m, i32 fd, i32 backlog) {
@@ -5275,7 +5447,96 @@ static int SysPipe(struct Machine *m, i64 pipefds_addr) {
   return SysPipe2(m, pipefds_addr, 0);
 }
 
-#ifdef HAVE_EPOLL_PWAIT1
+#if defined(HAVE_EMUFD)
+
+// epoll is emulated (see emufd.c): hosts like Emscripten have none, and
+// the emulation also covers the emulated eventfd, pipes and socket pairs.
+
+static i32 SysEpollCreate1(struct Machine *m, i32 flags) {
+  return EmuEpollCreate(m, flags);
+}
+
+static i32 SysEpollCreate(struct Machine *m, i32 size) {
+  if (size <= 0) return einval();
+  return EmuEpollCreate(m, 0);
+}
+
+static i32 SysEpollCtl(struct Machine *m, i32 epfd, i32 op, i32 fd,
+                       i64 eventaddr) {
+  u32 events = 0;
+  u64 data = 0;
+  const struct epoll_event_linux *gepe;
+  switch (op) {
+    case EPOLL_CTL_DEL_LINUX:
+      break;
+    case EPOLL_CTL_ADD_LINUX:
+    case EPOLL_CTL_MOD_LINUX:
+      if (!(gepe = (const struct epoll_event_linux *)SchlepR(m, eventaddr,
+                                                             sizeof(*gepe)))) {
+        return -1;
+      }
+      events = Read32(gepe->events);
+      data = Read64(gepe->data);
+      break;
+    default:
+      return einval();
+  }
+  return EmuEpollCtl(m, epfd, op, fd, events, data);
+}
+
+static i32 EpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
+                      i32 maxevents, struct timespec deadline, i64 sigmaskaddr,
+                      u64 sigsetsize) {
+  i32 rc;
+  u64 oldmask_guest = 0;
+  struct epoll_event_linux *gevents;
+  const struct sigset_linux *sigmaskp_guest = 0;
+  if (maxevents <= 0) return einval();
+  if (sigmaskaddr) {
+    if (sigsetsize != 8) return einval();
+    if (!(sigmaskp_guest = (const struct sigset_linux *)SchlepR(
+              m, sigmaskaddr, sizeof(*sigmaskp_guest)))) {
+      return -1;
+    }
+  }
+  if (!IsValidMemory(m, eventsaddr,
+                     maxevents * sizeof(struct epoll_event_linux),
+                     PROT_WRITE) ||
+      !(gevents = (struct epoll_event_linux *)AddToFreeList(
+            m, calloc(maxevents, sizeof(struct epoll_event_linux))))) {
+    return -1;
+  }
+  if (sigmaskp_guest) {
+    oldmask_guest = m->sigmask;
+    m->sigmask = Read64(sigmaskp_guest->sigmask);
+    SIG_LOGF("sigmask push %" PRIx64, m->sigmask);
+  }
+  if (!CheckInterrupt(m, false)) {
+    do {
+      rc = EmuEpollWait(m, epfd, gevents, maxevents, deadline);
+      if (rc == -1 && errno == EINTR) {
+        if (CheckInterrupt(m, false)) {
+          break;
+        }
+      } else {
+        break;
+      }
+    } while (1);
+  } else {
+    rc = -1;
+  }
+  if (sigmaskp_guest) {
+    m->sigmask = oldmask_guest;
+    SIG_LOGF("sigmask pop %" PRIx64, m->sigmask);
+  }
+  if (rc > 0) {
+    unassert(!CopyToUserWrite(m, eventsaddr, gevents,
+                              rc * sizeof(struct epoll_event_linux)));
+  }
+  return rc;
+}
+
+#elif defined(HAVE_EPOLL_PWAIT1)
 
 static i32 SysEpollCreate1(struct Machine *m, i32 flags) {
   int lim, fildes, oflags, sysflags;
@@ -5408,6 +5669,10 @@ static i32 EpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
   return rc;
 }
 
+#endif
+
+#if defined(HAVE_EPOLL_PWAIT1) || defined(HAVE_EMUFD)
+
 static i32 SysEpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
                          i32 maxevents, i32 timeout, i64 sigmaskaddr,
                          u64 sigsetsize) {
@@ -5440,7 +5705,17 @@ static int SysEpollWait(struct Machine *m, i32 epfd, i64 eventsaddr,
   return SysEpollPwait(m, epfd, eventsaddr, maxevents, timeout, 0, 8);
 }
 
-#endif /* HAVE_EPOLL_PWAIT1 */
+#endif /* HAVE_EPOLL_PWAIT1 || HAVE_EMUFD */
+
+#ifdef HAVE_EMUFD
+static i32 SysEventfd2(struct Machine *m, u32 initval, i32 flags) {
+  return EmuEventfd(m, initval, flags);
+}
+
+static i32 SysEventfd(struct Machine *m, u32 initval) {
+  return EmuEventfd(m, initval, 0);
+}
+#endif /* HAVE_EMUFD */
 
 void OpSyscall(P) {
   size_t mark;
@@ -5685,14 +5960,18 @@ void OpSyscall(P) {
     SYSCALL(5, 0x147, "preadv2", SysPreadv2, STRACE_PREADV2);
     SYSCALL(5, 0x148, "pwritev2", SysPwritev2, STRACE_PWRITEV2);
     SYSCALL(3, 0x1B4, "close_range", SysCloseRange, STRACE_3);
-#ifdef HAVE_EPOLL_PWAIT1
+#if defined(HAVE_EPOLL_PWAIT1) || defined(HAVE_EMUFD)
     SYSCALL(1, 0x0D5, "epoll_create", SysEpollCreate, STRACE_1);
     SYSCALL(1, 0x123, "epoll_create1", SysEpollCreate1, STRACE_1);
     SYSCALL(4, 0x0E9, "epoll_ctl", SysEpollCtl, STRACE_4);
     SYSCALL(4, 0x0E8, "epoll_wait", SysEpollWait, STRACE_4);
     SYSCALL(6, 0x119, "epoll_pwait", SysEpollPwait, STRACE_6);
     SYSCALL(6, 0x1B9, "epoll_pwait2", SysEpollPwait2, STRACE_6);
-#endif /* HAVE_EPOLL_PWAIT1 */
+#endif /* HAVE_EPOLL_PWAIT1 || HAVE_EMUFD */
+#ifdef HAVE_EMUFD
+    SYSCALL(1, 0x11C, "eventfd", SysEventfd, STRACE_1);
+    SYSCALL(2, 0x122, "eventfd2", SysEventfd2, STRACE_2);
+#endif
 #endif /* DISABLE_NONPOSIX */
     case 0x3C:
       SYS_LOGF("%s(%#" PRIx64 ")", "exit", di);
