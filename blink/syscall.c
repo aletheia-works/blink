@@ -1226,7 +1226,18 @@ static int SysMprotect(struct Machine *m, i64 addr, u64 size, int prot) {
 }
 
 static int SysMadvise(struct Machine *m, i64 addr, u64 len, int advice) {
-  return 0;
+  int rc;
+  // other advice is a hint we may ignore; MADV_DONTNEED (4) is not, since
+  // private anonymous memory must read back as zero afterwards
+  if (advice != 4) return 0;
+  if (addr & 4095) return einval();
+  if (!len) return 0;
+  BEGIN_NO_PAGE_FAULTS;
+  LOCK(&m->system->mmap_lock);
+  rc = ClearVirtual(m->system, addr, ROUNDUP(len, 4096));
+  UNLOCK(&m->system->mmap_lock);
+  END_NO_PAGE_FAULTS;
+  return rc;
 }
 
 static i64 SysBrk(struct Machine *m, i64 addr) {

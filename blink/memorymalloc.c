@@ -1224,6 +1224,43 @@ bool IsFullyMapped(struct System *s, i64 virt, i64 size) {
   }
 }
 
+// implements madvise(MADV_DONTNEED): private anonymous pages, including
+// [heap] and [stack], must read back as zero afterwards, since allocators
+// rely on that. pages never touched are already zero, and shared or file
+// mappings keep their contents as on linux. a private copy of a file page
+// should revert to the file, which isn't implemented; it keeps its data.
+// pages are cleared in place, so other threads' tlb entries stay valid.
+int ClearVirtual(struct System *s, i64 virt, i64 size) {
+  u8 *mi;
+  u64 pt;
+  i64 ti, end, level;
+  struct FileMap *fm;
+  if (!IsValidAddrSize(virt, size)) return einval();
+  if (!IsFullyMapped(s, virt, size)) return enomem();
+  for (end = virt + size;;) {
+    for (pt = s->cr3, level = 39; level >= 12; level -= 9) {
+      ti = (virt >> level) & 511;
+      mi = GetPageAddress(s, pt, level == 39) + ti * 8;
+      pt = LoadPte(mi);
+      if (level > 12) {
+        if (!(pt & PAGE_V)) return enomem();
+        continue;
+      }
+      for (;;) {
+        if (!(pt & PAGE_V)) return enomem();
+        if (!(pt & (PAGE_RSRV | PAGE_MAP)) &&
+            (!(pt & PAGE_FILE) || !(fm = GetFileMap(s, virt)) ||
+             fm->offset == -1)) {
+          ClearPage(GetPageAddress(s, pt, false));
+        }
+        if ((virt += 4096) >= end) return 0;
+        if (++ti == 512) break;
+        pt = LoadPte((mi += 8));
+      }
+    }
+  }
+}
+
 bool IsFullyUnmapped(struct System *s, i64 virt, i64 size) {
   u8 *mi;
   i64 end;

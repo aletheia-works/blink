@@ -489,6 +489,7 @@ i64 ReserveVirtual(struct System *, i64, i64, u64, int, i64, bool, bool);
 char *FormatPml4t(struct Machine *);
 i64 FindVirtual(struct System *, i64, i64);
 int FreeVirtual(struct System *, i64, i64);
+int ClearVirtual(struct System *, i64, i64);
 void CleanseMemory(struct System *, size_t);
 void LoadArgv(struct Machine *, char *, char *, char **, char **, u8[16]);
 _Noreturn void HaltMachine(struct Machine *, int);
