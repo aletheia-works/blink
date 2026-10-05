@@ -54,6 +54,7 @@ struct Allocator {
 
 struct Machine g_bssmachine;
 struct HostPages g_hostpages;
+static pthread_mutex_t_ g_hostpages_lock = PTHREAD_MUTEX_INITIALIZER_;
 
 static void FillPage(void *p, int c) {
   memset(p, c, 4096);
@@ -76,14 +77,25 @@ static u64 TrackHostPage(u8 *ptr) {
   if (HasLinearMapping()) {
     return (uintptr_t)ptr;
   } else {
+    // threads fault pages in concurrently, and FindHostPage() reads the
+    // table without a lock, so a grown table is published by pointer and
+    // the old one is never freed while another thread may still read it
+    LOCK(&g_hostpages_lock);
     if (g_hostpages.n == g_hostpages.c) {
-      g_hostpages.c += 1;
-      g_hostpages.c += g_hostpages.c >> 1;
-      g_hostpages.p =
-          realloc(g_hostpages.p, g_hostpages.c * sizeof(*g_hostpages.p));
+      size_t c2;
+      u8 **p2;
+      c2 = g_hostpages.c + 1;
+      c2 += c2 >> 1;
+      unassert((p2 = (u8 **)malloc(c2 * sizeof(*p2))));
+      if (g_hostpages.n) {
+        memcpy(p2, g_hostpages.p, g_hostpages.n * sizeof(*p2));
+      }
+      __atomic_store_n(&g_hostpages.p, p2, __ATOMIC_RELEASE);
+      g_hostpages.c = c2;
     }
     entry = g_hostpages.n++;
     g_hostpages.p[entry] = ptr;
+    UNLOCK(&g_hostpages_lock);
     return entry << 12;
   }
 }

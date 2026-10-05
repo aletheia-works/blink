@@ -103,7 +103,8 @@ u64 HandlePageFault(struct Machine *m, u8 *pslot, u64 entry) {
         m->system->memstat.reserved -= 1;
         entry = x;
       } else {
-        FreeAnonymousPage(m->system, (u8 *)(uintptr_t)(page & PAGE_TA));
+        // without a linear mapping, PAGE_TA holds a host page index
+        FreeAnonymousPage(m->system, FindHostPage(page));
         entry = LoadPte(pslot);
         m->system->rss -= 1;
       }

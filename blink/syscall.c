@@ -793,7 +793,7 @@ static int FutexWait(struct Machine *m, i64 uaddr, u32 expect,
         (slot < 0 && f->wakeseq != wakeseq) || Load32(mem) != expect) {
       rc = 0;
     } else {
-      tick = AddTime(tick, FromMilliseconds(kPollingMs));
+      tick = AddTime(GetTime(), FromMilliseconds(kPollingMs));
       if (CompareTime(tick, deadline) > 0) tick = deadline;
       rc = pthread_cond_timedwait(&f->cond, &f->lock, &tick);
       if (rc == ETIMEDOUT) {
@@ -805,7 +805,7 @@ static int FutexWait(struct Machine *m, i64 uaddr, u32 expect,
       if (rc == 0) rc = ETIMEDOUT;
     }
     UNLOCK(&f->lock);
-  } while (rc == ETIMEDOUT && CompareTime(tick, deadline) < 0);
+  } while (rc == ETIMEDOUT && CompareTime(GetTime(), deadline) < 0);
   LOCK(&g_bus->futexes.lock);
   LOCK(&f->lock);
   if (rc == ETIMEDOUT && slot >= 0 && f->slots[slot].woken) {

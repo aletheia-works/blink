@@ -842,7 +842,8 @@ static inline u8 *FindHostPage(u64 entry) {
   if (HasLinearMapping()) {
     return (u8 *)(uintptr_t)(entry & PAGE_TA);
   } else {
-    return g_hostpages.p[(entry & PAGE_TA) >> 12];
+    return __atomic_load_n(&g_hostpages.p, __ATOMIC_ACQUIRE)
+        [(entry & PAGE_TA) >> 12];
   }
 }
 
